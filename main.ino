@@ -1,133 +1,134 @@
-#include <Wire.h>
-#include <MPU6050.h>
+#include "Wire.h"
 
-MPU6050 mpu;
+const int MPU_ADDR = 0x68;
 
-struct KalmanFilter {
-  float Q_angle, Q_bias, R_measure;
-  float angle, bias, rate;
-  float P[2][2];
+int16_t accelerometer_x, accelerometer_y, accelerometer_z;
+int16_t gyro_x, gyro_y, gyro_z;
+int16_t temperature;
 
-  KalmanFilter() {
-    Q_angle = 0.001;
-    Q_bias = 0.003;
-    R_measure = 0.03;
-    angle = 0;
-    bias = 0;
-    P[0][0] = 0; P[0][1] = 0;
-    P[1][0] = 0; P[1][1] = 0;
-  }
+float kalman_angle_x, kalman_angle_y;
+float kalman_bias_x, kalman_bias_y;
+float P[2][2] = {{1, 0}, {0, 1}};
+float Q_angle = 0.001, Q_bias = 0.003, R_measure = 0.03;
 
-  float getAngle(float newAngle, float newRate, float dt) {
-    rate = newRate - bias;
-    angle += dt * rate;
-    P[0][0] += dt * (dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
-    P[0][1] -= dt * P[1][1];
-    P[1][0] -= dt * P[1][1];
-    P[1][1] += Q_bias * dt;
-    float S = P[0][0] + R_measure;
-    float K[2];
-    K[0] = P[0][0] / S;
-    K[1] = P[1][0] / S;
-    float y = newAngle - angle;
-    angle += K[0] * y;
-    bias += K[1] * y;
-    float P00_temp = P[0][0];
-    float P01_temp = P[0][1];
-    P[0][0] -= K[0] * P00_temp;
-    P[0][1] -= K[0] * P01_temp;
-    P[1][0] -= K[1] * P00_temp;
-    P[1][1] -= K[1] * P01_temp;
-    return angle;
-  }
+float accel_offset_x = 0, accel_offset_y = 0, accel_offset_z = 0;
+float gyro_offset_x = 0, gyro_offset_y = 0, gyro_offset_z = 0;
 
-  void setNoise(float processNoise, float measurementNoise) {
-    Q_angle = processNoise;
-    R_measure = measurementNoise;
-  }
-};
+char tmp_str[7];
 
-KalmanFilter kalmanX, kalmanY, kalmanZ;
+char* convert_int16_to_str(int16_t i) {
+  sprintf(tmp_str, "%6d", i);
+  return tmp_str;
+}
 
-float accelBiasX = 0, accelBiasY = 0, accelBiasZ = 0;
-float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
+void calibrate() {
+  int32_t ax_sum = 0, ay_sum = 0, az_sum = 0;
+  int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+  const int samples = 1000;
 
-void calibrateSensors(int samples) {
-  long sumAx = 0, sumAy = 0, sumAz = 0, sumGx = 0, sumGy = 0, sumGz = 0;
   for (int i = 0; i < samples; i++) {
-    int16_t ax, ay, az, gx, gy, gz;
-    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-    sumAx += ax; sumAy += ay; sumAz += az;
-    sumGx += gx; sumGy += gy; sumGz += gz;
-    delay(10);
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 14, true);
+
+    ax_sum += (Wire.read() << 8 | Wire.read());
+    ay_sum += (Wire.read() << 8 | Wire.read());
+    az_sum += (Wire.read() << 8 | Wire.read());
+    Wire.read(); Wire.read(); // Skip temperature
+    gx_sum += (Wire.read() << 8 | Wire.read());
+    gy_sum += (Wire.read() << 8 | Wire.read());
+    gz_sum += (Wire.read() << 8 | Wire.read());
+
+    delay(3); // Small delay for stability
   }
-  accelBiasX = sumAx / samples;
-  accelBiasY = sumAy / samples;
-  accelBiasZ = sumAz / samples;
-  gyroBiasX = sumGx / samples;
-  gyroBiasY = sumGy / samples;
-  gyroBiasZ = sumGz / samples;
+
+  accel_offset_x = ax_sum / samples;
+  accel_offset_y = ay_sum / samples;
+  accel_offset_z = az_sum / samples;
+  gyro_offset_x = gx_sum / samples;
+  gyro_offset_y = gy_sum / samples;
+  gyro_offset_z = gz_sum / samples;
+
+  Serial.println("Calibration complete.");
 }
 
-float calculateTemperature() {
-  int16_t rawTemp = mpu.getTemperature();
-  return rawTemp / 340.0 + 36.53;
-}
-
-float calculateRoll(float accelX, float accelY, float accelZ) {
-  return atan2(accelY, accelZ) * 180 / M_PI;
-}
-
-float calculatePitch(float accelX, float accelY, float accelZ) {
-  return atan2(-accelX, sqrt(accelY * accelY + accelZ * accelZ)) * 180 / M_PI;
-}
-
-float calculateYaw(float gyroZ, float dt) {
-  static float yaw = 0;
-  yaw += (gyroZ - gyroBiasZ) * dt;
-  return yaw;
+float complementary_filter(float new_angle, float new_rate, float dt, float* angle) {
+  *angle = 0.98 * (*angle + new_rate * dt) + 0.02 * new_angle;
+  return *angle;
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   Wire.begin();
-  mpu.initialize();
-  if (!mpu.testConnection()) {
-    Serial.println("MPU6050 connection failed");
-    while (1); 
-  }
-  calibrateSensors(500);
-  kalmanX.setNoise(0.001, 0.03);
-  kalmanY.setNoise(0.001, 0.03);
-  kalmanZ.setNoise(0.001, 0.03);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  calibrate(); // Call the calibration routine
 }
 
 void loop() {
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 14, true);
 
-  float accelX = (ax - accelBiasX) / 16384.0;
-  float accelY = (ay - accelBiasY) / 16384.0;
-  float accelZ = (az - accelBiasZ) / 16384.0;
-  float gyroX = (gx - gyroBiasX) / 131.0;
-  float gyroY = (gy - gyroBiasY) / 131.0;
-  float gyroZ = (gz - gyroBiasZ) / 131.0;
+  accelerometer_x = (Wire.read() << 8 | Wire.read()) - accel_offset_x;
+  accelerometer_y = (Wire.read() << 8 | Wire.read()) - accel_offset_y;
+  accelerometer_z = (Wire.read() << 8 | Wire.read()) - accel_offset_z;
+  temperature = Wire.read() << 8 | Wire.read();
+  gyro_x = (Wire.read() << 8 | Wire.read()) - gyro_offset_x;
+  gyro_y = (Wire.read() << 8 | Wire.read()) - gyro_offset_y;
+  gyro_z = (Wire.read() << 8 | Wire.read()) - gyro_offset_z;
 
   float dt = 0.01;
-  float roll = calculateRoll(accelX, accelY, accelZ);
-  float pitch = calculatePitch(accelX, accelY, accelZ);
-  float yaw = calculateYaw(gyroZ, dt);
+  float accel_angle_x = atan2(accelerometer_y, accelerometer_z) * 180 / 3.14159265359;
+  float accel_angle_y = atan2(accelerometer_x, accelerometer_z) * 180 / 3.14159265359;
 
-  float filteredRoll = kalmanX.getAngle(roll, gyroX, dt);
-  float filteredPitch = kalmanY.getAngle(pitch, gyroY, dt);
-  float filteredYaw = kalmanZ.getAngle(yaw, gyroZ, dt);
+  float gyro_rate_x = gyro_x / 131.0;
+  float gyro_rate_y = gyro_y / 131.0;
 
-  float temperature = calculateTemperature();
+  kalman_angle_x = complementary_filter(accel_angle_x, gyro_rate_x, dt, &kalman_angle_x);
+  kalman_angle_y = complementary_filter(accel_angle_y, gyro_rate_y, dt, &kalman_angle_y);
 
-  Serial.print("Roll: "); Serial.print(filteredRoll);
-  Serial.print(", Pitch: "); Serial.print(filteredPitch);
-  Serial.print(", Yaw: "); Serial.print(filteredYaw);
-  Serial.print(", Temp: "); Serial.println(temperature);
+  Serial.print("Tilt direction: ");
+  
+  if (kalman_angle_x > 10) {
+    Serial.print("Tilted Forward ");
+  } else if (kalman_angle_x < -10) {
+    Serial.print("Tilted Backward ");
+  }
 
-  delay(10);
+  if (kalman_angle_y > 10) {
+    Serial.print("Tilted Right ");
+  } else if (kalman_angle_y < -10) {
+    Serial.print("Tilted Left ");
+  }
+
+  if (abs(kalman_angle_x) <= 10 && abs(kalman_angle_y) <= 10) {
+    Serial.print("Stable ");
+  }
+
+  Serial.print(" | Acceleration: ");
+  
+  if (accelerometer_x > 3000) {
+    Serial.print("Accelerating Right ");
+  } else if (accelerometer_x < -3000) {
+    Serial.print("Accelerating Left ");
+  }
+
+  if (accelerometer_y > 3000) {
+    Serial.print("Accelerating Forward ");
+  } else if (accelerometer_y < -3000) {
+    Serial.print("Accelerating Backward ");
+  }
+
+  if (abs(accelerometer_x) <= 3000 && abs(accelerometer_y) <= 3000) {
+    Serial.print("Stable ");
+  }
+
+  Serial.println();
+  delay(100);
 }
